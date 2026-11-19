@@ -35,6 +35,14 @@ function norm(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+function isShortServerId(id) {
+  return /^[a-f0-9]{8}$/i.test(String(id || '').trim());
+}
+
+function isHostingSubId(id) {
+  return /^hosting-/i.test(String(id || '').trim());
+}
+
 function score(a, b) {
   a = norm(a);
   b = norm(b);
@@ -258,22 +266,18 @@ async function ocrPick(dir, prompt, n) {
   return results[0].i;
 }
 
-// 检查页面或 Shadow DOM 中的 Cap / 传统验证码是否已经完成
 async function isCaptchaSolved(page, rootSelector = '') {
   return page.evaluate((rootSel) => {
     const scope = (rootSel && document.querySelector(rootSel)) || document;
 
-    // 1. 检查传统 aria-checked
     const roleCb = scope.querySelector("[role='checkbox']");
     if (roleCb && roleCb.getAttribute('aria-checked') === 'true') return true;
 
-    // 2. 检查隐藏的 token input 是否已经有值
     const inputs = scope.querySelectorAll('input[name*="captcha"], input[name*="cap"], input[name*="token"]');
     for (const inp of inputs) {
       if (inp.value && inp.value.trim().length > 15) return true;
     }
 
-    // 3. 检查 <cap-widget> Web Component 属性或 Shadow DOM 状态
     const capWidget = scope.querySelector('cap-widget, [data-cap], .cap-widget');
     if (capWidget) {
       if (capWidget.getAttribute('data-state') === 'verified' || capWidget.hasAttribute('verified')) return true;
@@ -291,7 +295,6 @@ async function isCaptchaSolved(page, rootSelector = '') {
       }
     }
 
-    // 4. 检查页面可见文字是否变成了 Verified
     const allText = (scope.innerText || '').toLowerCase();
     if (allText.includes("you're human") === false && (allText.includes('verified') || allText.includes('vérifié'))) {
       return true;
@@ -300,7 +303,6 @@ async function isCaptchaSolved(page, rootSelector = '') {
   }, rootSelector).catch(() => false);
 }
 
-// 兼容新版 Cap 组件 (Verify you're human) 与旧版图片验证码
 async function solveCaptcha(page, prefix = '', apiContext = 'login') {
   await dismissCookieBanner(page);
   const root = prefix ? prefix + ' ' : '';
@@ -310,11 +312,10 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
     return null;
   }
 
-  // 1. 尝试多种方式点击 "Verify you're human" / Cap 复选框 (支持穿透 Shadow DOM)
   let clicked = false;
   const clickTargets = [
     page.locator(root + "text=/Verify you're human|Vérifiez que vous êtes humain/i").first(),
-    page.locator(root + "cap-widget").first(),
+    page.locator(root + 'cap-widget').first(),
     page.locator(root + "div[role='checkbox']").first(),
     page.locator(root + "input[type='checkbox']").first(),
   ];
@@ -323,10 +324,8 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
     if (await loc.isVisible().catch(() => false)) {
       log('找到可见验证码组件，执行点击...');
       try {
-        // 先尝试点击元素左侧复选框位置或中心
         const box = await loc.boundingBox().catch(() => null);
         if (box && box.width > 100) {
-          // 点击左侧复选框区域 (距离左边缘 28px, 垂直居中)
           await page.mouse.click(box.x + 28, box.y + box.height / 2);
         } else {
           await loc.click({ timeout: 5000, force: true });
@@ -339,7 +338,6 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
     }
   }
 
-  // 同时通过 JS 穿透 Shadow DOM 触发内部 checkbox/button 点击兜底
   await page.evaluate((rootSel) => {
     const scope = (rootSel && document.querySelector(rootSel)) || document;
     const cap = scope.querySelector('cap-widget');
@@ -351,7 +349,6 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
 
   log('已触发验证码点击，等待 Cap 算力验证或图片加载...');
 
-  // 2. 循环等待 12 秒：看是否直接无感通过 (Cap PoW 算力验证通常在 2~8 秒内完成)，或者是否弹出了传统 4 图选择框
   const startTime = Date.now();
   let hasImgOptions = false;
 
@@ -370,7 +367,6 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
     await page.waitForTimeout(500);
   }
 
-  // 3. 如果弹出了传统的 4 张图片验证码 (.auth-captcha-option-img)，走 OCR 识别
   if (hasImgOptions) {
     log('检测到传统图片验证码，启动 OCR 识别...');
     await page.waitForFunction(
@@ -412,7 +408,6 @@ async function solveCaptcha(page, prefix = '', apiContext = 'login') {
     return null;
   }
 
-  // 4. 如果既没有检测到明确通过信号，也没弹出图片，尝试通过 API 获取验证码 Token 并注入表单兜底
   log('尝试通过 API 求解验证码作为双保险 (context: ' + apiContext + ')...');
   try {
     const token = await solveCaptchaApi(page, apiContext);
@@ -713,39 +708,125 @@ function formatRemaining(expiresAt) {
   return d + '天' + h + '小时 (到期: ' + expStr + ')';
 }
 
+function detectNotYetAvailable(text) {
+  const s = String(text || '');
+  const patterns = [
+    /Free renewal opens on[^\n.]*/i,
+    /Renewal opens on[^\n.]*/i,
+    /Renewal will be available[^\n.]*/i,
+    /renouvellement(?:\s+gratuit)?\s+(?:sera disponible|ouvre)[^\n.]*/i,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m) return m[0].trim();
+  }
+  return null;
+}
+
+function extractRemainingText(text, expiresAt) {
+  const s = String(text || '');
+  const m1 = s.match(/(?:Time remaining|Expire dans)\s*:?\s*([0-9]+[dj](?:\s*[0-9]+h)?)/i);
+  if (m1) return m1[1].trim();
+  const m2 = s.match(/(\d+\s*(?:days?|hours?|d|h|j)\s*(?:left|remaining))/i);
+  if (m2) return m2[1].trim();
+  return formatRemaining(expiresAt);
+}
+
+async function scrapeShortServerIdsFromPage(page) {
+  return page
+    .evaluate(() => {
+      const found = [];
+      const urlMatch = window.location.href.match(/\/(?:server|servers|projects)\/([a-f0-9]{8})(?:\/|$|\?)/i);
+      if (urlMatch) found.push(urlMatch[1]);
+
+      document.querySelectorAll('[data-server-id], [data-server], [data-identifier]').forEach((el) => {
+        const val =
+          el.getAttribute('data-server-id') ||
+          el.getAttribute('data-server') ||
+          el.getAttribute('data-identifier');
+        if (val && /^[a-f0-9]{8}$/i.test(val.trim())) found.push(val.trim());
+      });
+      document.querySelectorAll('a[href]').forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/\/(?:server|servers|projects)\/([a-f0-9]{8})(?:\/|$|\?)/i);
+        if (m) found.push(m[1]);
+      });
+      const html = document.documentElement.innerHTML;
+      const regex = /"(?:identifier|server_identifier)"\s*:\s*"([a-f0-9]{8})"/gi;
+      let match;
+      while ((match = regex.exec(html)) !== null) {
+        found.push(match[1]);
+      }
+      return [...new Set(found)];
+    })
+    .catch(() => []);
+}
+
 async function discover(page) {
-  const map = new Map();
-  const addServer = (s) => {
-    if (!s || !s.id) return;
-    const id = String(s.id).trim();
-    if (!id || id === 'undefined' || id === 'null') return;
-    const existing = map.get(id) || {};
-    map.set(id, {
-      id,
-      uuid: s.uuid || existing.uuid || id,
-      name: s.name || existing.name || id,
-      expiresAt: s.expiresAt || existing.expiresAt || null,
-      canRenew: s.canRenew ?? existing.canRenew ?? false,
-    });
+  const list = [];
+
+  const upsertServer = (s) => {
+    if (!s) return;
+    const rawId = String(s.id || '').trim();
+    const serverId = String(s.serverId || (isShortServerId(rawId) ? rawId : '')).trim();
+    const subscriptionId = String(s.subscriptionId || (isHostingSubId(rawId) ? rawId : '')).trim();
+    const primaryId = serverId || rawId || subscriptionId;
+    if (!primaryId || primaryId === 'undefined' || primaryId === 'null') return;
+
+    const nameKey = s.name && s.name !== rawId ? norm(s.name) : '';
+    const existing = list.find(
+      (item) =>
+        (serverId && item.serverId === serverId) ||
+        (subscriptionId && item.subscriptionId === subscriptionId) ||
+        item.id === primaryId ||
+        (s.uuid && item.uuid && item.uuid === s.uuid) ||
+        (nameKey && item.name && norm(item.name) === nameKey)
+    );
+
+    if (existing) {
+      if (serverId) {
+        existing.serverId = serverId;
+        existing.id = serverId;
+      }
+      if (subscriptionId) existing.subscriptionId = subscriptionId;
+      if (s.uuid && !existing.uuid) existing.uuid = s.uuid;
+      if (s.name && s.name !== rawId && (!existing.name || existing.name === existing.id)) {
+        existing.name = s.name;
+      }
+      if (s.expiresAt && !existing.expiresAt) existing.expiresAt = s.expiresAt;
+      if (typeof s.canRenew === 'boolean') existing.canRenew = s.canRenew;
+    } else {
+      list.push({
+        id: primaryId,
+        serverId: serverId || null,
+        subscriptionId: subscriptionId || null,
+        uuid: s.uuid || primaryId,
+        name: s.name || primaryId,
+        expiresAt: s.expiresAt || null,
+        canRenew: typeof s.canRenew === 'boolean' ? s.canRenew : null,
+      });
+    }
   };
 
   if (SERVER_ID) {
-    addServer({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID });
+    upsertServer({ id: SERVER_ID, serverId: isShortServerId(SERVER_ID) ? SERVER_ID : '', uuid: SERVER_ID, name: SERVER_ID });
   }
 
   const r1 = await api(page, '/api/client');
   if (r1.status === 200) {
-    const list = Array.isArray(r1.data?.data) ? r1.data.data : Array.isArray(r1.data?.servers) ? r1.data.servers : [];
-    for (const item of list) {
+    const items = Array.isArray(r1.data?.data) ? r1.data.data : Array.isArray(r1.data?.servers) ? r1.data.servers : [];
+    for (const item of items) {
       const attr = item.attributes || item;
-      const id = attr.identifier || attr.server_identifier || attr.id || attr.uuid;
+      const sid = attr.identifier || attr.server_identifier || '';
+      const id = sid || attr.id || attr.uuid;
       if (id) {
-        addServer({
+        upsertServer({
           id,
+          serverId: isShortServerId(sid) ? sid : undefined,
           uuid: attr.uuid || id,
           name: attr.name || attr.project_name || String(id),
           expiresAt: attr.expires_at || attr.renews_at || null,
-          canRenew: Boolean(attr.can_renew),
+          canRenew: typeof attr.can_renew === 'boolean' ? attr.can_renew : undefined,
         });
       }
     }
@@ -762,20 +843,29 @@ async function discover(page) {
       : [];
     for (const item of rawList) {
       const attr = item.attributes || item.server || item;
-      const id =
+      const shortId =
         attr.server_identifier ||
         attr.identifier ||
-        attr.server_id ||
         item.server_identifier ||
         item.identifier ||
-        attr.id;
+        item.server?.identifier ||
+        '';
+      const subId = isHostingSubId(item.id || attr.id) ? (item.id || attr.id) : '';
+      const id = shortId || subId || attr.server_id || attr.id;
       if (id) {
-        addServer({
+        upsertServer({
           id,
-          uuid: attr.uuid || id,
+          serverId: isShortServerId(shortId) ? shortId : undefined,
+          subscriptionId: subId || undefined,
+          uuid: attr.uuid || item.uuid || id,
           name: attr.name || attr.server_name || item.name || String(id),
           expiresAt: attr.expires_at || item.expires_at || attr.renews_at || null,
-          canRenew: Boolean(attr.can_renew ?? item.can_renew),
+          canRenew:
+            typeof attr.can_renew === 'boolean'
+              ? attr.can_renew
+              : typeof item.can_renew === 'boolean'
+              ? item.can_renew
+              : undefined,
         });
       }
     }
@@ -783,48 +873,28 @@ async function discover(page) {
 
   await page.goto(BASE + '/dashboard/projects', { waitUntil: 'domcontentloaded' }).catch(() => {});
   await page.waitForTimeout(1500);
-
-  const domIds = await page
-    .evaluate(() => {
-      const found = [];
-      document.querySelectorAll('[data-server-id], [data-server], [data-identifier]').forEach((el) => {
-        const val =
-          el.getAttribute('data-server-id') ||
-          el.getAttribute('data-server') ||
-          el.getAttribute('data-identifier');
-        if (val) found.push(val.trim());
-      });
-      document.querySelectorAll('a[href]').forEach((a) => {
-        const href = a.getAttribute('href') || '';
-        const m = href.match(/\/(?:server|servers|projects)\/([a-f0-9]{8})(?:\/|$|\?)/i);
-        if (m) found.push(m[1]);
-      });
-      const html = document.documentElement.innerHTML;
-      const regex = /"identifier"\s*:\s*"([a-f0-9]{8})"/gi;
-      let match;
-      while ((match = regex.exec(html)) !== null) {
-        found.push(match[1]);
-      }
-      return [...new Set(found)];
-    })
-    .catch(() => []);
-
+  const domIds = await scrapeShortServerIdsFromPage(page);
   for (const id of domIds) {
-    if (!map.has(id)) {
-      addServer({ id, uuid: id, name: id });
+    if (list.length === 1 && !list[0].serverId) {
+      list[0].serverId = id;
+    } else if (!list.some((s) => s.serverId === id || s.id === id)) {
+      upsertServer({ id, serverId: id, uuid: id, name: id });
     }
   }
 
-  let servers = [...map.values()];
+  let servers = list;
   if (SERVER_ID) {
-    const matched = servers.filter((s) => s.id === SERVER_ID || s.uuid === SERVER_ID);
+    const matched = servers.filter(
+      (s) => s.id === SERVER_ID || s.serverId === SERVER_ID || s.subscriptionId === SERVER_ID || s.uuid === SERVER_ID
+    );
     if (matched.length > 0) servers = matched;
   }
 
   const serverLogStr = servers
     .map((s) => {
       const exp = s.expiresAt ? s.expiresAt : '未知';
-      return s.name + '(' + s.id + ') 到期:' + exp;
+      const idLabel = s.serverId && s.subscriptionId ? `${s.serverId}/${s.subscriptionId}` : s.id;
+      return s.name + '(' + idLabel + ') 到期:' + exp;
     })
     .join(', ');
   log('发现服务: ' + (serverLogStr ? serverLogStr : '(无)'));
@@ -865,9 +935,17 @@ function classifyRenew(r) {
 
 function looksLikeRenewAction(text) {
   const s = String(text || '').trim().toLowerCase();
-  if (!s) return false;
-  if (s.includes('?') || s.includes('renewal') || s.includes('renouvellement')) return false;
-  if (s.length > 90) return false;
+  if (!s || s.length > 60) return false;
+  if (
+    s.includes('?') ||
+    /\brenewals?\b/.test(s) ||
+    /\brenouvellements?\b/.test(s) ||
+    /\b\d+\s+to\s+renew\b/.test(s) ||
+    /\bto\s+renew\b/.test(s) ||
+    /opens?\s+on|available|ouvre/i.test(s)
+  ) {
+    return false;
+  }
   return /\brenew\b/.test(s) || /\brenouveler\b/.test(s) || /\bextend\b/.test(s) || /续期|延长/.test(s);
 }
 
@@ -880,6 +958,11 @@ async function findVisibleRenewButton(page, server) {
     const item = locator.nth(i);
     const info = await item
       .evaluate((el) => {
+        // 排除顶部栏、侧边栏、导航、Tab 切换项，避免误点 "1 to renew" / "Renewals 1"
+        if (el.closest('nav, header, aside, [role="tablist"], [role="tab"]')) return null;
+        const href = (el.getAttribute('href') || '').toLowerCase();
+        if (href && /\/renewals(?:[/?#]|$)/.test(href)) return null;
+
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
         const text = [
@@ -913,10 +996,11 @@ async function findVisibleRenewButton(page, server) {
 
     const haystack = (info.cardText + ' ' + info.text).toLowerCase();
     let s = 100;
+    if (server?.serverId && haystack.includes(String(server.serverId).toLowerCase())) s += 50;
     if (server?.id && haystack.includes(String(server.id).toLowerCase())) s += 50;
     if (server?.uuid && haystack.includes(String(server.uuid).toLowerCase())) s += 40;
     if (server?.name && haystack.includes(String(server.name).toLowerCase())) s += 30;
-    if (/^\s*(renew|renew now|renouveler|extend|续期|延长)\s*$/i.test(info.text)) s += 25;
+    if (/^\s*(?:free\s+)?(renew|renew now|renew free|renouveler|extend|续期|立即续期|延长)\s*$/i.test(info.text)) s += 25;
     s -= Math.max(0, info.top) / 1000;
     scored.push({ item, info, score: s });
   }
@@ -930,7 +1014,7 @@ async function findVisibleRenewButton(page, server) {
 async function clickRenewUi(page, server) {
   const btn = await findVisibleRenewButton(page, server);
   if (!btn) {
-    log('未找到可见可点击的 UI 续期按钮,跳过 UI 方案');
+    log('未找到可见可点击的 UI 续期按钮');
     return false;
   }
   await btn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
@@ -939,25 +1023,51 @@ async function clickRenewUi(page, server) {
   return true;
 }
 
+async function openRenewalsTabIfPresent(page) {
+  const tab = page.locator('button:has-text("Renewals"), a:has-text("Renewals"), [role="tab"]:has-text("Renewals"), button:has-text("Renouvellements"), a:has-text("Renouvellements")').first();
+  if (await tab.isVisible().catch(() => false)) {
+    log('切换到 Renewals 标签页...');
+    await tab.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+  }
+}
+
 async function navigateToServerRenewPage(page, server) {
-  const id = server.id;
   const candidateUrls = [
-    BASE + '/server/' + id,
-    BASE + '/dashboard/projects/' + id,
+    BASE + '/dashboard/services',
+    ...(server.serverId ? [BASE + '/server/' + server.serverId] : []),
+    ...(server.subscriptionId ? [BASE + '/dashboard/projects/' + server.subscriptionId] : []),
     BASE + '/dashboard/projects',
   ];
 
-  for (const url of candidateUrls) {
+  for (const url of [...new Set(candidateUrls)]) {
     log('访问服务页面: ' + url);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2200);
     await dismissCookieBanner(page);
+
+    if (url.endsWith('/dashboard/services')) {
+      await openRenewalsTabIfPresent(page);
+    }
+
+    // 顺便从页面补全真实 8 位 serverId
+    if (!server.serverId) {
+      const scraped = await scrapeShortServerIdsFromPage(page);
+      if (scraped.length === 1) {
+        server.serverId = scraped[0];
+        log('从页面解析到真实 serverId: ' + server.serverId);
+      }
+    }
 
     if (await findVisibleRenewButton(page, server)) {
       return;
     }
+
     const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-    if (/Time remaining|Expire dans|Renewal will be available|renouvellement sera disponible|Server suspended/i.test(bodyText)) {
+    if (
+      detectNotYetAvailable(bodyText) ||
+      /Time remaining|Expire dans|Server suspended/i.test(bodyText)
+    ) {
       return;
     }
 
@@ -966,7 +1076,20 @@ async function navigateToServerRenewPage(page, server) {
       log('点击 Manage 按钮进入详情页...');
       await manageBtn.click({ timeout: 8000 }).catch(() => {});
       await page.waitForTimeout(2500);
+
+      if (!server.serverId) {
+        const scraped = await scrapeShortServerIdsFromPage(page);
+        if (scraped.length >= 1) {
+          server.serverId = scraped[0];
+          log('从 Manage 详情页解析到真实 serverId: ' + server.serverId);
+        }
+      }
+
       if (await findVisibleRenewButton(page, server)) {
+        return;
+      }
+      const detailText = await page.evaluate(() => document.body.innerText).catch(() => '');
+      if (detectNotYetAvailable(detailText)) {
         return;
       }
     }
@@ -974,7 +1097,7 @@ async function navigateToServerRenewPage(page, server) {
 }
 
 async function tryRenew(page, server) {
-  const id = server.id;
+  const id = server.serverId || server.id;
   const name = server.name || id;
   log('开始检查续期: ' + name + ' (' + id + ')');
 
@@ -984,8 +1107,8 @@ async function tryRenew(page, server) {
   await shot(page, '05-server-page-' + id + '.png');
 
   const initialBody = await page.evaluate(() => document.body.innerText).catch(() => '');
-  const notYetMatch = initialBody.match(/Renewal will be available[^\n.]*|renouvellement sera disponible[^\n.]*/i);
-  const timeRemMatch = initialBody.match(/(?:Time remaining|Expire dans)\s*:\s*([0-9]+[dj]\s*[0-9]*h?)/i);
+  const notYetNotice = detectNotYetAvailable(initialBody);
+  const remStr = extractRemainingText(initialBody, server.expiresAt) || '充足';
 
   let uiRenewRes = null;
   const responseHandler = async (res) => {
@@ -1027,7 +1150,6 @@ async function tryRenew(page, server) {
         log('弹窗验证码处理异常: ' + e.message);
       }
 
-      // 如果服务从 Suspended 恢复后处于 Offline 状态，自动点击右上角 Start 开机
       const startBtn = page.locator("button:has-text('Start'), button:has-text('Démarrer')").first();
       if (await startBtn.isVisible().catch(() => false)) {
         const isDisabled = await startBtn.isDisabled().catch(() => false);
@@ -1047,21 +1169,21 @@ async function tryRenew(page, server) {
       }
 
       const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-      const newRemMatch = bodyText.match(/(?:Time remaining|Expire dans)\s*:?\s*([0-9]+[dj](?:\s*[0-9]+h)?)/i);
-      if (
-        newRemMatch ||
-        /Renewal will be available/i.test(bodyText) ||
-        /renouvellement sera disponible/i.test(bodyText)
-      ) {
-        const exp = newRemMatch ? '剩余 ' + newRemMatch[1] : '成功延期';
-        log('UI 续期验证成功: ' + exp);
-        return { id, ok: true, skip: false, text: name + ' (' + id + '): 续期成功 (' + exp + ')' };
+      const afterNotYet = detectNotYetAvailable(bodyText);
+      if (!notYetNotice && afterNotYet) {
+        const newRem = extractRemainingText(bodyText, server.expiresAt) || afterNotYet;
+        log('UI 续期验证成功: ' + newRem);
+        return { id, ok: true, skip: false, text: name + ' (' + id + '): 续期成功 (' + newRem + ')' };
       }
       log('UI 点击后未确认续期成功,继续尝试 API 续期接口');
-    } else if (notYetMatch) {
-      const remStr = timeRemMatch ? timeRemMatch[1] : (formatRemaining(server.expiresAt) || '充足');
-      log('页面显示未到续期窗口 (' + notYetMatch[0] + '), 剩余: ' + remStr);
-      return { id, ok: true, skip: true, text: name + ' (' + id + '): 未到续期窗口，剩余 ' + remStr };
+    } else if (notYetNotice) {
+      log('页面显示未到续期窗口 (' + notYetNotice + '), 剩余: ' + remStr);
+      return {
+        id,
+        ok: true,
+        skip: true,
+        text: name + ' (' + id + '): 未到续期窗口（' + notYetNotice + '），剩余 ' + remStr,
+      };
     }
   } catch (e) {
     log('UI 续期按钮点击失败,改走 API 续期: ' + e.message);
@@ -1070,8 +1192,16 @@ async function tryRenew(page, server) {
     page.off('response', responseHandler);
   }
 
-  log('尝试 API 续期接口...');
-  const renewPath = '/api/client/servers/' + id + '/upgrade/renew';
+  // 仅使用有效的 Pterodactyl serverId 调用升级续期 API，避免用 hosting-... 触发 404
+  const apiServerId = server.serverId || (isHostingSubId(id) ? null : id);
+  if (!apiServerId) {
+    const fallbackMsg = '未找到可用续期按钮，且未能解析到 8 位服务器 ID (当前仅获取到订阅 ID: ' + id + '，可在 Secrets 中配置 ACL_SERVER_ID)';
+    log(fallbackMsg);
+    return { id, ok: false, skip: false, text: name + ' (' + id + '): ' + fallbackMsg };
+  }
+
+  log('尝试 API 续期接口 (serverId: ' + apiServerId + ')...');
+  const renewPath = '/api/client/servers/' + apiServerId + '/upgrade/renew';
   let r = await api(page, renewPath, 'POST', {});
   let c = classifyRenew(r);
 
@@ -1099,14 +1229,14 @@ async function tryRenew(page, server) {
     }
   }
 
-  let resultText = name + ' (' + id + '): ' + c.text;
+  let resultText = name + ' (' + apiServerId + '): ' + c.text;
   const exactRemaining = formatRemaining(server.expiresAt);
   if (c.skip && exactRemaining) {
-    resultText = name + ' (' + id + '): 未到续期窗口，剩余 ' + exactRemaining;
+    resultText = name + ' (' + apiServerId + '): 未到续期窗口，剩余 ' + exactRemaining;
   }
 
   log('API 续期结果: ' + resultText);
-  return { id, ok: c.ok, skip: c.skip, text: resultText };
+  return { id: apiServerId, ok: c.ok, skip: c.skip, text: resultText };
 }
 
 function resolveExecutablePath() {
@@ -1211,4 +1341,4 @@ if (isMain) {
   });
 }
 
-export { score, ocrScore, classifyRenew };
+export { score, ocrScore, classifyRenew, looksLikeRenewAction };
